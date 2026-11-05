@@ -1,15 +1,16 @@
+import os
+import pickle
 import random
 from collections import defaultdict
- 
+
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from sklearn.feature_extraction.text import CountVectorizer
 
 
-
 # ----------------------------------------------------------------------------
-# Stage 0: reply graph
+# Stage 0: build graph for Louvain
 # ----------------------------------------------------------------------------
 def build_reply_graph(df, min_degree=3):
     """Weighted undirected user graph as dict: node -> {neighbor: weight}.
@@ -162,3 +163,216 @@ def rank_subreddits(cands, comm_users, sub_users, n_users_total, min_cov=0.05):
             lift = cov / (len(sub_users[s]) / n_users_total)
             out[c].append((s, cov, lift, jac))
     return {c: sorted(v, key=lambda t: -t[2]) for c, v in out.items()}
+
+
+# ----------------------------------------------------------------------------
+# Stage 3: log-odds ratio with informative Dirichlet prior (Monroe et al. 2008)
+# ----------------------------------------------------------------------------
+def community_term_matrix(docs, min_count=20):
+    """Counts per community; drops terms with fewer than min_count total occurrences
+    (a corpus-wide count cutoff, NOT a document-frequency cutoff: there are few documents)."""
+    cv = CountVectorizer(stop_words="english", token_pattern=r"[a-z]{3,}")
+    Y = cv.fit_transform(docs).tocsr()
+    words = np.array(cv.get_feature_names_out())
+    keep = np.asarray(Y.sum(axis=0)).ravel() >= min_count
+    return Y[:, np.flatnonzero(keep)], words[keep]
+ 
+ 
+def log_odds_z(Y, alpha0=1000.0):
+    """Returns dense (n_comm, n_terms) z-scores: community i vs. all other communities."""
+    y_tot = np.asarray(Y.sum(axis=0)).ravel().astype(float)
+    alpha = alpha0 * y_tot / y_tot.sum()                 # prior ∝ global frequency
+    Z = np.zeros(Y.shape)
+    for i in range(Y.shape[0]):
+        y_i = Y.getrow(i).toarray().ravel().astype(float)
+        y_r = y_tot - y_i
+        n_i, n_r = y_i.sum(), y_r.sum()
+        l_i = np.log((y_i + alpha) / (n_i + alpha0 - y_i - alpha))
+        l_r = np.log((y_r + alpha) / (n_r + alpha0 - y_r - alpha))
+        var = 1.0 / (y_i + alpha) + 1.0 / (y_r + alpha)
+        Z[i] = (l_i - l_r) / np.sqrt(var)
+    return Z
+ 
+ 
+def top_terms(Z, words, i, n=10):
+    return list(words[np.argsort(Z[i])[::-1][:n]])
+ 
+ 
+def tfidf_top_terms(Y, words, i, n=10):
+    """Plain TF.IDF baseline (Week 1 definition) for comparison."""
+    Yd = Y.getrow(i).toarray().ravel().astype(float)
+    tf = Yd / Yd.max()
+    n_t = np.asarray((Y > 0).sum(axis=0)).ravel()
+    idf = np.log2(Y.shape[0] / n_t)
+    return list(words[np.argsort(tf * idf)[::-1][:n]])
+ 
+ 
+def npmi_coherence(top_words, B, vocab_index):
+    """NPMI coherence of a word list. B: binary (docs x terms) csc matrix over a
+    reference corpus (e.g. individual comments); vocab_index: word -> column."""
+    N = B.shape[0]
+    cols = [vocab_index[w] for w in top_words if w in vocab_index]
+    df = np.asarray(B[:, cols].sum(axis=0)).ravel()
+    co = (B[:, cols].T @ B[:, cols]).toarray()
+    scores = []
+    for a in range(len(cols)):
+        for c in range(a + 1, len(cols)):
+            p1, p2, p12 = df[a] / N, df[c] / N, co[a, c] / N
+            if p12 == 0:
+                scores.append(-1.0)
+            else:
+                scores.append(np.log(p12 / (p1 * p2)) / -np.log(p12))
+    return float(np.mean(scores)) if scores else float("nan")
+
+
+# ----------------------------------------------------------------------------
+# Glue: run all stages on a comments DataFrame
+# ----------------------------------------------------------------------------
+def run(df, level=0, min_comm_size=30, min_comments_per_sub=2,
+        k=128, b=64, r=2, alpha0=1000.0, max_comments_per_user=50, min_count=20, seed=0):
+    # Stage 1
+    adj = build_reply_graph(df)
+    levels = louvain(adj, seed=seed)
+    for i, (m, q) in enumerate(levels):
+        print(f"Louvain level {i}: {len(set(m.values()))} communities, modularity {q:.3f}")
+    membership, _ = levels[min(level, len(levels) - 1)]
+    sizes = pd.Series(membership).value_counts()
+    keep = sizes[sizes >= min_comm_size].index.tolist()
+    comm_id = {c: i for i, c in enumerate(keep)}
+    user_comm = {u: comm_id[c] for u, c in membership.items() if c in comm_id}
+    n_comm = len(keep)
+ 
+    # Stage 2: sets
+    graph_users = sorted(user_comm)
+    uid = {u: i for i, u in enumerate(graph_users)}
+    sub_names = sorted(df["subreddit"].unique())
+    sid = {s: i for i, s in enumerate(sub_names)}
+    d = df[df["author"].isin(uid)]
+    cnt = d.groupby(["author", "subreddit"]).size().reset_index(name="n")
+    cnt = cnt[cnt.n >= min_comments_per_sub]
+ 
+    pairs_set = np.r_[[user_comm[u] for u in graph_users],
+                      n_comm + cnt["subreddit"].map(sid).values]
+    pairs_user = np.r_[np.arange(len(graph_users)), cnt["author"].map(uid).values]
+    sig = minhash(pairs_set, pairs_user, n_comm + len(sub_names), k=k, seed=seed)
+ 
+    comm_users = [np.array(sorted(uid[u] for u, c in user_comm.items() if c == i)) for i in range(n_comm)]
+    sub_users = [np.sort(cnt.loc[cnt.subreddit == s, "author"].map(uid).values) for s in sub_names]
+    cands = lsh_candidates(sig, n_comm, b, r)
+    print(f"LSH: {len(cands)} candidate pairs out of {n_comm * len(sub_names)} possible")
+    ranked = rank_subreddits(cands, comm_users, sub_users, len(graph_users))
+ 
+    # Stage 3
+    d = d.copy()
+    d["comm"] = d["author"].map(user_comm)
+    d = d.groupby("author", group_keys=False).head(max_comments_per_user)
+    docs = d.groupby("comm")["body"].apply(" ".join).reindex(range(n_comm)).fillna("")
+    Y, words = community_term_matrix(docs.tolist(), min_count=min_count)
+    Z = log_odds_z(Y, alpha0=alpha0)
+ 
+    for c in range(n_comm):
+        print(f"\nCommunity {c}  ({len(comm_users[c])} users)")
+        print("  subreddits (by lift):",
+              [(sub_names[s], round(cov, 2), round(lift, 1)) for s, cov, lift, _ in ranked.get(c, [])[:5]])
+        print("  log-odds words      :", top_terms(Z, words, c))
+        print("  tf-idf words        :", tfidf_top_terms(Y, words, c))
+    return {"adj": adj, "levels": levels, "ranked": ranked, "Z": Z, "words": words, "sig": sig}
+
+
+def save(obj, path):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+ 
+ 
+def load(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+ 
+ 
+def select_communities(levels, level=0, min_comm_size=30):
+    """Pick one Louvain level and drop small communities.
+    Returns user_comm: dict user -> community index 0..n_comm-1."""
+    membership, _ = levels[min(level, len(levels) - 1)]
+    sizes = pd.Series(membership).value_counts()
+    keep = sizes[sizes >= min_comm_size].index.tolist()
+    comm_id = {c: i for i, c in enumerate(keep)}
+    return {u: comm_id[c] for u, c in membership.items() if c in comm_id}
+ 
+ 
+def match_subreddits(df, user_comm, min_comments_per_sub=2, k=128, b=64, r=2, seed=0):
+    """Stage 2: MinHash + LSH + exact verification.
+    Returns dict(ranked, sub_names, comm_sizes, n_candidates, sig)."""
+    n_comm = max(user_comm.values()) + 1
+    graph_users = sorted(user_comm)
+    uid = {u: i for i, u in enumerate(graph_users)}
+    sub_names = sorted(df["subreddit"].unique())
+    sid = {s: i for i, s in enumerate(sub_names)}
+ 
+    d = df[df["author"].isin(uid)]
+    cnt = d.groupby(["author", "subreddit"]).size().reset_index(name="n")
+    cnt = cnt[cnt.n >= min_comments_per_sub]
+ 
+    # one list of (set id, user index) pairs: communities first, then subreddits
+    pairs_set = np.r_[[user_comm[u] for u in graph_users],
+                      n_comm + cnt["subreddit"].map(sid).values]
+    pairs_user = np.r_[np.arange(len(graph_users)), cnt["author"].map(uid).values]
+    sig = minhash(pairs_set, pairs_user, n_comm + len(sub_names), k=k, seed=seed)
+ 
+    comm_users = [np.array(sorted(uid[u] for u, c in user_comm.items() if c == i))
+                  for i in range(n_comm)]
+    sub_users = [np.sort(cnt.loc[cnt.subreddit == s, "author"].map(uid).values)
+                 for s in sub_names]
+    cands = lsh_candidates(sig, n_comm, b, r)
+    ranked = rank_subreddits(cands, comm_users, sub_users, len(graph_users))
+    return {"ranked": ranked, "sub_names": sub_names, "n_candidates": len(cands),
+                "n_possible": n_comm * len(sub_names),
+                "comm_sizes": [len(c) for c in comm_users], "sig": sig}
+ 
+ 
+def label_words(df, user_comm, max_comments_per_user=50, min_count=20,
+                alpha0=1000.0, seed=0):
+    """Stage 3: one document per community, then log-odds z-scores.
+    Returns dict(Z, Y, words). Comments per user are capped by a random sample."""
+    n_comm = max(user_comm.values()) + 1
+    d = df[df["author"].isin(user_comm)].sample(frac=1, random_state=seed)
+    d = d.groupby("author", group_keys=False).head(max_comments_per_user)
+    d = d.assign(comm=d["author"].map(user_comm))
+    docs = d.groupby("comm")["body"].apply(" ".join).reindex(range(n_comm)).fillna("")
+    Y, words = community_term_matrix(docs.tolist(), min_count=min_count)
+    return {"Z": log_odds_z(Y, alpha0=alpha0), "Y": Y, "words": words}
+ 
+ 
+def report(matches, labels, top=5):
+    """Print the combined description of every community."""
+    print(f"LSH: {matches['n_candidates']} candidate pairs out of {matches['n_possible']} possible")
+    for c, size in enumerate(matches["comm_sizes"]):
+        print(f"\nCommunity {c}  ({size} users)")
+        print("  subreddits (name, coverage, lift):",
+              [(matches["sub_names"][s], round(cov, 2), round(lift, 1))
+               for s, cov, lift, _ in matches["ranked"].get(c, [])[:top]])
+        print("  log-odds words:", top_terms(labels["Z"], labels["words"], c))
+        print("  tf-idf words  :", [w for w in tfidf_top_terms(labels["Y"], labels["words"], c)])
+ 
+ 
+def run(df, level=0, min_comm_size=30, cache_dir=None, seed=0,
+        match_args=None, label_args=None):
+    """Thin wrapper that chains the stages. With cache_dir, each stage's output is
+    saved to disk and reloaded on the next call (delete the file to redo a stage)."""
+    def cached(name, fn):
+        path = os.path.join(cache_dir, name + ".pkl") if cache_dir else None
+        if path and os.path.exists(path):
+            return load(path)
+        out = fn()
+        if path:
+            save(out, path)
+        return out
+ 
+    levels = cached("louvain_levels", lambda: louvain(build_reply_graph(df), seed=seed))
+    for i, (m, q) in enumerate(levels):
+        print(f"Louvain level {i}: {len(set(m.values()))} communities, modularity {q:.3f}")
+    user_comm = select_communities(levels, level, min_comm_size)
+    matches = cached("matches", lambda: match_subreddits(df, user_comm, seed=seed, **(match_args or {})))
+    labels = cached("labels", lambda: label_words(df, user_comm, seed=seed, **(label_args or {})))
+    report(matches, labels)
+    return {"levels": levels, "user_comm": user_comm, "matches": matches, "labels": labels}
