@@ -1,3 +1,4 @@
+
 import os
 import pickle
 import random
@@ -10,17 +11,19 @@ from sklearn.feature_extraction.text import CountVectorizer
 
 
 # ----------------------------------------------------------------------------
-# Stage 0: build graph for Louvain
+# Stage 0: reply graph
 # ----------------------------------------------------------------------------
-def build_reply_graph(df, min_degree=3):
+def build_reply_graph(df, posts=None, min_degree=3, drop_authors=("[deleted]", "AutoModerator")):
     """Weighted undirected user graph as dict: node -> {neighbor: weight}.
-    Edge weight = number of replies between two users (either direction).
-    Replies are taken regardless of subreddit, to avoid rediscovering subreddits."""
+    Edge weight = number of replies between two users (either direction)."""
     author_of = dict(zip(df["id"], df["author"]))
-    parent = df["parent_id"].str.replace("t1_", "", regex=False)
+    if posts is not None:
+        post_ids = posts["id"].astype(str).str.replace(r"^t3_", "", regex=True)
+        author_of.update(zip(post_ids, posts["author"]))
+    parent = df["parent_id"].astype(str).str.replace(r"^t[13]_", "", regex=True)
     pa = parent.map(author_of)
     edges = pd.DataFrame({"a": df["author"].values, "b": pa.values}).dropna()
-    edges = edges[edges.a != edges.b]
+    edges = edges[(edges.a != edges.b) & ~edges.a.isin(drop_authors) & ~edges.b.isin(drop_authors)]
     lo = np.where(edges.a < edges.b, edges.a, edges.b)
     hi = np.where(edges.a < edges.b, edges.b, edges.a)
     w = pd.DataFrame({"a": lo, "b": hi}).value_counts()
@@ -40,12 +43,10 @@ def build_reply_graph(df, min_degree=3):
                 if m in adj:
                     adj[m].pop(n, None)
     return adj
-
-
+ 
+ 
 # ----------------------------------------------------------------------------
-# Stage 1: Louvain (own implementation)
-# Convention: A is symmetric; A[i][i] of an aggregated node = sum of internal A_ij
-# (both directions), k_i = sum_j A_ij, m2 = sum_ij A_ij = 2m.
+# Stage 1: Louvain 
 # ----------------------------------------------------------------------------
 def modularity(adj, comm):
     m2 = sum(sum(nb.values()) for nb in adj.values())
@@ -109,9 +110,9 @@ def louvain(adj, seed=0):
         cur = _aggregate(cur, comm)
     return levels
  
-
- # ----------------------------------------------------------------------------
-# Stage 2: MinHash + LSH  (communities and subreddits share one signature matrix)
+ 
+# ----------------------------------------------------------------------------
+# Stage 2: MinHash + LSH  
 # ----------------------------------------------------------------------------
 P = np.uint64(4294967311)  # prime just above 2^32; a, x < 2^32 so a*x+b fits in uint64
  
@@ -163,8 +164,8 @@ def rank_subreddits(cands, comm_users, sub_users, n_users_total, min_cov=0.05):
             lift = cov / (len(sub_users[s]) / n_users_total)
             out[c].append((s, cov, lift, jac))
     return {c: sorted(v, key=lambda t: -t[2]) for c, v in out.items()}
-
-
+ 
+ 
 # ----------------------------------------------------------------------------
 # Stage 3: log-odds ratio with informative Dirichlet prior (Monroe et al. 2008)
 # ----------------------------------------------------------------------------
@@ -204,7 +205,9 @@ def tfidf_top_terms(Y, words, i, n=10):
     tf = Yd / Yd.max()
     n_t = np.asarray((Y > 0).sum(axis=0)).ravel()
     idf = np.log2(Y.shape[0] / n_t)
-    return list(words[np.argsort(tf * idf)[::-1][:n]])
+    score = tf * idf
+    top = np.argsort(score)[::-1][:n]
+    return list(words[top[score[top] > 0]])      # drop zero-score filler
  
  
 def npmi_coherence(top_words, B, vocab_index):
@@ -223,62 +226,14 @@ def npmi_coherence(top_words, B, vocab_index):
             else:
                 scores.append(np.log(p12 / (p1 * p2)) / -np.log(p12))
     return float(np.mean(scores)) if scores else float("nan")
-
-
+ 
+ 
 # ----------------------------------------------------------------------------
-# Glue: run all stages on a comments DataFrame
+# Stage functions: each takes inputs and returns outputs, so people can own one
+# stage each and re-run one stage without redoing the others.
 # ----------------------------------------------------------------------------
-def run(df, level=0, min_comm_size=30, min_comments_per_sub=2,
-        k=128, b=64, r=2, alpha0=1000.0, max_comments_per_user=50, min_count=20, seed=0):
-    # Stage 1
-    adj = build_reply_graph(df)
-    levels = louvain(adj, seed=seed)
-    for i, (m, q) in enumerate(levels):
-        print(f"Louvain level {i}: {len(set(m.values()))} communities, modularity {q:.3f}")
-    membership, _ = levels[min(level, len(levels) - 1)]
-    sizes = pd.Series(membership).value_counts()
-    keep = sizes[sizes >= min_comm_size].index.tolist()
-    comm_id = {c: i for i, c in enumerate(keep)}
-    user_comm = {u: comm_id[c] for u, c in membership.items() if c in comm_id}
-    n_comm = len(keep)
  
-    # Stage 2: sets
-    graph_users = sorted(user_comm)
-    uid = {u: i for i, u in enumerate(graph_users)}
-    sub_names = sorted(df["subreddit"].unique())
-    sid = {s: i for i, s in enumerate(sub_names)}
-    d = df[df["author"].isin(uid)]
-    cnt = d.groupby(["author", "subreddit"]).size().reset_index(name="n")
-    cnt = cnt[cnt.n >= min_comments_per_sub]
  
-    pairs_set = np.r_[[user_comm[u] for u in graph_users],
-                      n_comm + cnt["subreddit"].map(sid).values]
-    pairs_user = np.r_[np.arange(len(graph_users)), cnt["author"].map(uid).values]
-    sig = minhash(pairs_set, pairs_user, n_comm + len(sub_names), k=k, seed=seed)
- 
-    comm_users = [np.array(sorted(uid[u] for u, c in user_comm.items() if c == i)) for i in range(n_comm)]
-    sub_users = [np.sort(cnt.loc[cnt.subreddit == s, "author"].map(uid).values) for s in sub_names]
-    cands = lsh_candidates(sig, n_comm, b, r)
-    print(f"LSH: {len(cands)} candidate pairs out of {n_comm * len(sub_names)} possible")
-    ranked = rank_subreddits(cands, comm_users, sub_users, len(graph_users))
- 
-    # Stage 3
-    d = d.copy()
-    d["comm"] = d["author"].map(user_comm)
-    d = d.groupby("author", group_keys=False).head(max_comments_per_user)
-    docs = d.groupby("comm")["body"].apply(" ".join).reindex(range(n_comm)).fillna("")
-    Y, words = community_term_matrix(docs.tolist(), min_count=min_count)
-    Z = log_odds_z(Y, alpha0=alpha0)
- 
-    for c in range(n_comm):
-        print(f"\nCommunity {c}  ({len(comm_users[c])} users)")
-        print("  subreddits (by lift):",
-              [(sub_names[s], round(cov, 2), round(lift, 1)) for s, cov, lift, _ in ranked.get(c, [])[:5]])
-        print("  log-odds words      :", top_terms(Z, words, c))
-        print("  tf-idf words        :", tfidf_top_terms(Y, words, c))
-    return {"adj": adj, "levels": levels, "ranked": ranked, "Z": Z, "words": words, "sig": sig}
-
-
 def save(obj, path):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "wb") as f:
@@ -341,6 +296,12 @@ def label_words(df, user_comm, max_comments_per_user=50, min_count=20,
     docs = d.groupby("comm")["body"].apply(" ".join).reindex(range(n_comm)).fillna("")
     Y, words = community_term_matrix(docs.tolist(), min_count=min_count)
     return {"Z": log_odds_z(Y, alpha0=alpha0), "Y": Y, "words": words}
+
+
+def community_names(labels, n_words=3):
+    """Name each community by its top log-odds words, e.g. 'python / error / pandas'."""
+    return {c: " / ".join(top_terms(labels["Z"], labels["words"], c, n_words))
+            for c in range(labels["Z"].shape[0])}
  
  
 def report(matches, labels, top=5):
@@ -355,7 +316,7 @@ def report(matches, labels, top=5):
         print("  tf-idf words  :", [w for w in tfidf_top_terms(labels["Y"], labels["words"], c)])
  
  
-def run(df, level=0, min_comm_size=30, cache_dir=None, seed=0,
+def run(df, posts=None, level=0, min_comm_size=30, cache_dir=None, seed=0,
         match_args=None, label_args=None):
     """Thin wrapper that chains the stages. With cache_dir, each stage's output is
     saved to disk and reloaded on the next call (delete the file to redo a stage)."""
@@ -368,7 +329,7 @@ def run(df, level=0, min_comm_size=30, cache_dir=None, seed=0,
             save(out, path)
         return out
  
-    levels = cached("louvain_levels", lambda: louvain(build_reply_graph(df), seed=seed))
+    levels = cached("louvain_levels", lambda: louvain(build_reply_graph(df, posts), seed=seed))
     for i, (m, q) in enumerate(levels):
         print(f"Louvain level {i}: {len(set(m.values()))} communities, modularity {q:.3f}")
     user_comm = select_communities(levels, level, min_comm_size)
@@ -376,3 +337,68 @@ def run(df, level=0, min_comm_size=30, cache_dir=None, seed=0,
     labels = cached("labels", lambda: label_words(df, user_comm, seed=seed, **(label_args or {})))
     report(matches, labels)
     return {"levels": levels, "user_comm": user_comm, "matches": matches, "labels": labels}
+
+
+# ----------------------------------------------------------------------------
+# Evaluation: null model and seed stability 
+# ----------------------------------------------------------------------------
+def to_unweighted(adj):
+    """Same graph with every edge weight set to 1 (and self-loops removed)."""
+    return {n: {m: 1.0 for m in nb if m != n} for n, nb in adj.items()}
+ 
+ 
+def rewire(adj, swaps_per_edge=10, seed=0):
+    """Degree-preserving random rewiring (double edge swap): pick edges (a,b) and (c,d),
+    replace them by (a,d) and (c,b) unless that makes a self-loop or a duplicate edge.
+    Every node keeps its number of neighbours; the structure is randomized."""
+    rng = random.Random(seed)
+    nbrs = {n: set(nb) for n, nb in adj.items()}
+    edges = [(a, b) for a, nb in adj.items() for b in nb if str(a) < str(b)]
+    n_edges = len(edges)
+    for _ in range(swaps_per_edge * n_edges):
+        i, j = rng.randrange(n_edges), rng.randrange(n_edges)
+        (a, b), (c, d) = edges[i], edges[j]
+        if rng.random() < 0.5:
+            c, d = d, c
+        if len({a, b, c, d}) < 4 or d in nbrs[a] or b in nbrs[c]:
+            continue
+        nbrs[a].remove(b); nbrs[b].remove(a); nbrs[c].remove(d); nbrs[d].remove(c)
+        nbrs[a].add(d); nbrs[d].add(a); nbrs[c].add(b); nbrs[b].add(c)
+        edges[i], edges[j] = (a, d), (c, b)
+    return {n: {m: 1.0 for m in s} for n, s in nbrs.items()}
+ 
+ 
+def _level_q(levels, level):
+    """Modularity at a level; level=-1 means the coarsest (last) level."""
+    idx = len(levels) - 1 if level == -1 else min(level, len(levels) - 1)
+    return levels[idx][1]
+ 
+ 
+def null_model_test(adj, n_null=20, level=-1, seed=0):
+    """Is the modularity of the real graph larger than in degree-preserving random graphs?
+    Uses the unweighted graph for both, so the comparison is fair.
+    Returns dict(real, null_mean, null_std, z, null_scores)."""
+    G = to_unweighted(adj)
+    real = _level_q(louvain(G, seed=seed), level)
+    nulls = [_level_q(louvain(rewire(G, seed=seed + i), seed=seed + i), level)
+             for i in range(1, n_null + 1)]
+    mean, std = float(np.mean(nulls)), float(np.std(nulls, ddof=1))
+    return {"real": real, "null_mean": mean, "null_std": std,
+                "z": (real - mean) / std if std > 0 else float("inf"), "null_scores": nulls}
+ 
+ 
+def seed_stability(adj, n_seeds=10, level=-1):
+    """Run Louvain with different seeds and compare the partitions pairwise with NMI
+    (1 = identical partitions, 0 = unrelated). Returns dict(nmi_mean, nmi_std, q_mean, q_std)."""
+    from sklearn.metrics import normalized_mutual_info_score as nmi
+    nodes = sorted(adj, key=str)
+    parts, qs = [], []
+    for sd in range(n_seeds):
+        levels = louvain(adj, seed=sd)
+        idx = len(levels) - 1 if level == -1 else min(level, len(levels) - 1)
+        member = levels[idx][0]
+        parts.append([member[n] for n in nodes])
+        qs.append(levels[idx][1])
+    scores = [nmi(parts[i], parts[j]) for i in range(n_seeds) for j in range(i + 1, n_seeds)]
+    return {"nmi_mean": float(np.mean(scores)), "nmi_std": float(np.std(scores)),
+            "q_mean": float(np.mean(qs)), "q_std": float(np.std(qs))}
