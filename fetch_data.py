@@ -3,8 +3,8 @@
 Steps (each API answer is cached as JSON in data/cache, so a rerun skips finished requests):
 1. users:      everyone with at least MIN_SEED_COMMENTS comments in one of the seed subreddits
                (June-September 2026), asked month by month (week by week if a month is too heavy).
-               We use a random sample of SAMPLE_SIZE of them (None = all), because the API limits
-               how fast we can ask; the cache makes it easy to grow the sample later.
+               We use all of them (SAMPLE_SIZE = None); a number instead takes a random sample,
+               e.g. for a quick test, as the API limits how fast we can ask.
 2. activity:   for each user, the subreddits they posted or commented in over the same period
                (top 100 per user). Each subreddit becomes the set of our users who are active in it.
 3. comments:   COMMENTS_PER_SUBREDDIT comments for every subreddit with at least MIN_USERS members
@@ -14,7 +14,7 @@ We first tried to fetch every commenter of each subreddit (comments/search/aggre
 but those queries hit the API's ~10 s limit for most active subreddits. The per-user endpoint is
 fast and never failed, so the sets are built from user histories instead.
 
-To get more data, raise SAMPLE_SIZE or add seed subreddits and rerun. Two requests run in parallel
+To get more data, add seed subreddits and rerun. Two requests run in parallel
 (WORKERS) and we wait whenever the API asks us to slow down; expect about 30 users per minute.
 Run in a notebook cell or as: python fetch_data.py
 """
@@ -33,7 +33,7 @@ CACHE = Path("data/cache")
 SEED_SUBREDDITS = ["datascience", "MachineLearning", "dataengineering", "statistics"]
 START, END = "2026-06-01", "2026-10-01"
 MIN_SEED_COMMENTS = 2         # users need at least this many comments in a seed subreddit
-SAMPLE_SIZE = 3000            # random sample of the seed users (None = all of them)
+SAMPLE_SIZE = None            # None = all seed users (as in the report); a number = random sample
 MIN_COUNT = 2                 # a user is a member of a subreddit with at least this many posts/comments
 MIN_USERS = 10                # comments are fetched for subreddits with at least this many members
 COMMENTS_PER_SUBREDDIT = 100

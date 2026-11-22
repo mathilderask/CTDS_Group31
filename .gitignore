@@ -1,3 +1,7 @@
 data/cache/
 __pycache__/
 .ipynb_checkpoints/
+.venv/
+.idea/
+fetch.log
+nohup.out
