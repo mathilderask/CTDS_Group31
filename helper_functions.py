@@ -1,53 +1,139 @@
-
-import os
-import pickle
 import random
+import time
 from collections import defaultdict
+from itertools import combinations
 
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from sklearn.feature_extraction.text import CountVectorizer
 
+BOTS = ("[deleted]", "AutoModerator")
+
 
 # ----------------------------------------------------------------------------
-# Stage 0: reply graph
+# Stage 0: one set of users per subreddit
 # ----------------------------------------------------------------------------
-def build_reply_graph(df, posts=None, min_degree=3, drop_authors=("[deleted]", "AutoModerator")):
-    """Weighted undirected user graph as dict: node -> {neighbor: weight}.
-    Edge weight = number of replies between two users (either direction)."""
-    author_of = dict(zip(df["id"], df["author"]))
-    if posts is not None:
-        post_ids = posts["id"].astype(str).str.replace(r"^t3_", "", regex=True)
-        author_of.update(zip(post_ids, posts["author"]))
-    parent = df["parent_id"].astype(str).str.replace(r"^t[13]_", "", regex=True)
-    pa = parent.map(author_of)
-    edges = pd.DataFrame({"a": df["author"].values, "b": pa.values}).dropna()
-    edges = edges[(edges.a != edges.b) & ~edges.a.isin(drop_authors) & ~edges.b.isin(drop_authors)]
-    lo = np.where(edges.a < edges.b, edges.a, edges.b)
-    hi = np.where(edges.a < edges.b, edges.b, edges.a)
-    w = pd.DataFrame({"a": lo, "b": hi}).value_counts()
- 
+def is_bot(user):
+    """Deleted accounts, AutoModerator, mod-team accounts and names ending in 'bot'."""
+    return user in BOTS or user.endswith("-ModTeam") or user.lower().endswith("bot")
+
+
+def subreddit_sets(activity, min_count=1, min_users=10, exclude=()):
+    """activity: one row per (user, subreddit, count). A user belongs to a subreddit's set with at
+    least min_count posts/comments there; subreddits need at least min_users members. Subreddits in
+    exclude (the seed subreddits, which contain every user) are dropped.
+    Returns dict(names, set_idx, user_idx, sizes, n_users): one (set, user) pair per membership."""
+    members = activity[(activity["count"] >= min_count) & ~activity["user"].map(is_bot)
+                       & ~activity["subreddit"].isin(exclude)]
+    sizes = members.groupby("subreddit").size()
+    members = members[members["subreddit"].isin(sizes[sizes >= min_users].index)]
+    names = sorted(members["subreddit"].unique())
+    set_id = {s: i for i, s in enumerate(names)}
+    user_codes, users = pd.factorize(members["user"])
+    return {"names": names,
+            "set_idx": members["subreddit"].map(set_id).to_numpy(),
+            "user_idx": user_codes.astype(np.int64),
+            "sizes": members.groupby("subreddit").size().reindex(names).to_numpy(),
+            "n_users": len(users)}
+
+
+# ----------------------------------------------------------------------------
+# Stage 1: MinHash + LSH (Week 4), checked against exact Jaccard
+# ----------------------------------------------------------------------------
+P = np.uint64(4294967311)  # prime just above 2^32; a, x < 2^32 so a*x+b fits in uint64
+
+
+def minhash(set_idx, user_idx, n_sets, k=128, seed=0):
+    """set_idx[i], user_idx[i] = one (set, member) pair (deduplicated).
+    Returns signature matrix (k, n_sets); empty sets stay at P."""
+    rng = np.random.default_rng(seed)
+    A = rng.integers(1, 2**32, size=k, dtype=np.uint64)
+    B = rng.integers(0, 2**32, size=k, dtype=np.uint64)
+    order = np.argsort(set_idx, kind="stable")
+    s, u = set_idx[order], user_idx[order].astype(np.uint64)
+    starts = np.flatnonzero(np.r_[True, s[1:] != s[:-1]])
+    present = s[starts]
+    sig = np.full((k, n_sets), P, dtype=np.uint64)
+    for h in range(k):
+        hv = (A[h] * u + B[h]) % P
+        sig[h, present] = np.minimum.reduceat(hv, starts)
+    return sig
+
+
+def lsh_pairs(sig, b, r):
+    """Banding technique: split the signature into b bands of r rows and put every set in one
+    bucket per band (identical band values = same bucket). Candidate pairs share a bucket in at
+    least one band. Returns a set of (i, j) with i < j."""
+    assert b * r <= sig.shape[0]
+    candidates = set()
+    for band in range(b):
+        block = np.ascontiguousarray(sig[band * r:(band + 1) * r].T)
+        buckets = defaultdict(list)
+        for i in range(block.shape[0]):
+            buckets[block[i].tobytes()].append(i)
+        for members in buckets.values():
+            candidates.update(combinations(members, 2))
+    return candidates
+
+
+def s_curve(s, b, r):
+    """Probability that a pair with Jaccard similarity s becomes a candidate."""
+    return 1 - (1 - np.asarray(s, dtype=float) ** r) ** b
+
+
+def jaccard_matrix(set_idx, user_idx, n_sets):
+    """Exact Jaccard similarity of all pairs of sets, via a sparse set x user matrix."""
+    M = sp.csr_matrix((np.ones(len(set_idx)), (set_idx, user_idx)), shape=(n_sets, user_idx.max() + 1))
+    inter = (M @ M.T).toarray()
+    size = np.diag(inter)
+    return inter / (size[:, None] + size[None, :] - inter)
+
+
+def all_pairs_jaccard(user_sets):
+    """The approach LSH replaces: compare every pair of sets directly (Python sets)."""
+    J = {}
+    for i, j in combinations(range(len(user_sets)), 2):
+        inter = len(user_sets[i] & user_sets[j])
+        J[i, j] = inter / (len(user_sets[i]) + len(user_sets[j]) - inter)
+    return J
+
+
+def verify(candidates, user_sets, threshold):
+    """Exact Jaccard for the candidate pairs only; keeps the pairs with J >= threshold."""
+    similar = {}
+    for i, j in candidates:
+        inter = len(user_sets[i] & user_sets[j])
+        jac = inter / (len(user_sets[i]) + len(user_sets[j]) - inter)
+        if jac >= threshold:
+            similar[i, j] = jac
+    return similar
+
+
+def lsh_quality(candidates, J, threshold):
+    """Compare LSH candidates with the exact similar pairs (J >= threshold).
+    False negatives: similar pairs LSH missed. False positives: candidates below the threshold."""
+    n = J.shape[0]
+    i, j = np.triu_indices(n, k=1)
+    similar = {(a, b) for a, b in zip(i, j) if J[a, b] >= threshold}
+    found = candidates & similar
+    return {"pairs": len(i), "candidates": len(candidates), "similar": len(similar),
+            "false_neg": len(similar - found), "false_pos": len(candidates - similar),
+            "recall": len(found) / len(similar) if similar else float("nan")}
+
+
+# ----------------------------------------------------------------------------
+# Stage 2: similarity graph + Louvain (Week 7)
+# ----------------------------------------------------------------------------
+def similarity_graph(similar, names):
+    """Weighted undirected graph as dict: node -> {neighbor: weight}, weight = Jaccard."""
     adj = defaultdict(dict)
-    for (a, b), c in w.items():
-        adj[a][b] = float(c)
-        adj[b][a] = float(c)
-    adj = dict(adj)
-    # iterative degree filter (a simple k-core)
-    while True:
-        drop = [n for n, nb in adj.items() if len(nb) < min_degree]
-        if not drop:
-            break
-        for n in drop:
-            for m in adj.pop(n, {}):
-                if m in adj:
-                    adj[m].pop(n, None)
-    return adj
- 
- 
-# ----------------------------------------------------------------------------
-# Stage 1: Louvain 
-# ----------------------------------------------------------------------------
+    for (i, j), jac in similar.items():
+        adj[names[i]][names[j]] = jac
+        adj[names[j]][names[i]] = jac
+    return dict(adj)
+
+
 def modularity(adj, comm):
     m2 = sum(sum(nb.values()) for nb in adj.values())
     inner, tot = defaultdict(float), defaultdict(float)
@@ -57,8 +143,8 @@ def modularity(adj, comm):
                 inner[comm[i]] += a
             tot[comm[i]] += a
     return sum(inner[c] / m2 - (tot[c] / m2) ** 2 for c in tot)
- 
- 
+
+
 def _local_moving(adj, rng, eps=1e-9):
     k = {i: sum(nb.values()) for i, nb in adj.items()}
     m2 = sum(k.values())
@@ -86,16 +172,16 @@ def _local_moving(adj, rng, eps=1e-9):
                 comm[i] = best
                 moved = improved = True
     return comm, improved
- 
- 
+
+
 def _aggregate(adj, comm):
     new = defaultdict(lambda: defaultdict(float))
     for i, nb in adj.items():
         for j, a in nb.items():
             new[comm[i]][comm[j]] += a
     return {c: dict(nb) for c, nb in new.items()}
- 
- 
+
+
 def louvain(adj, seed=0):
     """Returns a list of levels: (membership dict original_node -> community, modularity)."""
     rng = random.Random(seed)
@@ -109,66 +195,37 @@ def louvain(adj, seed=0):
         levels.append((dict(member), modularity(adj, member)))
         cur = _aggregate(cur, comm)
     return levels
- 
- 
+
+
 # ----------------------------------------------------------------------------
-# Stage 2: MinHash + LSH  
+# Stage 3 (outside method): log-odds ratio with informative Dirichlet prior (Monroe et al. 2008)
 # ----------------------------------------------------------------------------
-P = np.uint64(4294967311)  # prime just above 2^32; a, x < 2^32 so a*x+b fits in uint64
- 
- 
-def minhash(set_idx, user_idx, n_sets, k=128, seed=0):
-    """set_idx[i], user_idx[i] = one (set, member) pair (deduplicated).
-    Returns signature matrix (k, n_sets); empty sets stay at P."""
-    rng = np.random.default_rng(seed)
-    A = rng.integers(1, 2**32, size=k, dtype=np.uint64)
-    B = rng.integers(0, 2**32, size=k, dtype=np.uint64)
-    order = np.argsort(set_idx, kind="stable")
-    s, u = set_idx[order], user_idx[order].astype(np.uint64)
-    starts = np.flatnonzero(np.r_[True, s[1:] != s[:-1]])
-    present = s[starts]
-    sig = np.full((k, n_sets), P, dtype=np.uint64)
-    for h in range(k):
-        hv = (A[h] * u + B[h]) % P
-        sig[h, present] = np.minimum.reduceat(hv, starts)
-    return sig
- 
- 
-def lsh_candidates(sig, n_comm, b, r, max_bucket=500):
-    """Candidate (community, subreddit) pairs only; sets 0..n_comm-1 are communities."""
-    assert b * r <= sig.shape[0]
-    cands = set()
-    for band in range(b):
-        block = np.ascontiguousarray(sig[band * r:(band + 1) * r].T)
-        buckets = defaultdict(lambda: ([], []))
-        for idx in range(block.shape[0]):
-            if block[idx, 0] == P:             # empty set
-                continue
-            side = 0 if idx < n_comm else 1
-            buckets[block[idx].tobytes()][side].append(idx)
-        for cs, ss in buckets.values():
-            if cs and ss and len(cs) + len(ss) <= max_bucket:
-                cands.update((c, s - n_comm) for c in cs for s in ss)
-    return cands
- 
- 
-def rank_subreddits(cands, comm_users, sub_users, n_users_total, min_cov=0.05):
-    """Exact verification. comm_users/sub_users: lists of sorted unique int arrays.
-    coverage = |C∩S|/|C| ; lift = coverage / (|S|/N)."""
-    out = defaultdict(list)
-    for c, s in cands:
-        inter = np.intersect1d(comm_users[c], sub_users[s], assume_unique=True).size
-        cov = inter / len(comm_users[c])
-        if cov >= min_cov:
-            jac = inter / (len(comm_users[c]) + len(sub_users[s]) - inter)
-            lift = cov / (len(sub_users[s]) / n_users_total)
-            out[c].append((s, cov, lift, jac))
-    return {c: sorted(v, key=lambda t: -t[2]) for c, v in out.items()}
- 
- 
-# ----------------------------------------------------------------------------
-# Stage 3: log-odds ratio with informative Dirichlet prior (Monroe et al. 2008)
-# ----------------------------------------------------------------------------
+def community_documents(comments, sub_comm, n_comm):
+    """One document per community: all sampled comments of its subreddits."""
+    text = comments.dropna(subset=["body"])
+    text = text[~text["author"].astype(str).map(is_bot) & ~text["body"].isin(["[deleted]", "[removed]"])]
+    text = text.assign(comm=text["subreddit"].map(sub_comm)).dropna(subset=["comm"])
+    body = text["body"].str.lower().str.replace(r"http\S+", " ", regex=True)
+    return body.groupby(text["comm"].astype(int)).apply(" ".join).reindex(range(n_comm)).fillna("").tolist()
+
+
+def label_spread(label_words, subreddits, comments):
+    """Share of a community's subreddits whose comment sample contains each label word, averaged
+    over the words. A good label describes the whole community, not just one of its subreddits."""
+    text = comments[comments["subreddit"].isin(subreddits)].groupby("subreddit")["body"].apply(
+        lambda bodies: set(" ".join(bodies.dropna().astype(str)).lower().split()))
+    if not label_words or text.empty:
+        return float("nan")
+    return float(np.mean([np.mean([word in words for words in text]) for word in label_words]))
+
+
+def generic_share(label_words, Y, words, n_common=50):
+    """Share of the label words that are among the n_common most frequent words of all
+    communities together. Such words say little about one community."""
+    common = set(words[np.argsort(np.asarray(Y.sum(axis=0)).ravel())[::-1][:n_common]])
+    return float(np.mean([w in common for w in label_words])) if label_words else float("nan")
+
+
 def community_term_matrix(docs, min_count=20):
     """Counts per community; drops terms with fewer than min_count total occurrences
     (a corpus-wide count cutoff, NOT a document-frequency cutoff: there are few documents)."""
@@ -177,8 +234,8 @@ def community_term_matrix(docs, min_count=20):
     words = np.array(cv.get_feature_names_out())
     keep = np.asarray(Y.sum(axis=0)).ravel() >= min_count
     return Y[:, np.flatnonzero(keep)], words[keep]
- 
- 
+
+
 def log_odds_z(Y, alpha0=1000.0):
     """Returns dense (n_comm, n_terms) z-scores: community i vs. all other communities."""
     y_tot = np.asarray(Y.sum(axis=0)).ravel().astype(float)
@@ -193,160 +250,33 @@ def log_odds_z(Y, alpha0=1000.0):
         var = 1.0 / (y_i + alpha) + 1.0 / (y_r + alpha)
         Z[i] = (l_i - l_r) / np.sqrt(var)
     return Z
- 
- 
+
+
 def top_terms(Z, words, i, n=10):
     return list(words[np.argsort(Z[i])[::-1][:n]])
- 
- 
+
+
 def tfidf_top_terms(Y, words, i, n=10):
     """Plain TF.IDF baseline (Week 1 definition) for comparison."""
     Yd = Y.getrow(i).toarray().ravel().astype(float)
+    if Yd.max() == 0:                            # community without comments
+        return []
     tf = Yd / Yd.max()
     n_t = np.asarray((Y > 0).sum(axis=0)).ravel()
     idf = np.log2(Y.shape[0] / n_t)
     score = tf * idf
     top = np.argsort(score)[::-1][:n]
     return list(words[top[score[top] > 0]])      # drop zero-score filler
- 
- 
-def npmi_coherence(top_words, B, vocab_index):
-    """NPMI coherence of a word list. B: binary (docs x terms) csc matrix over a
-    reference corpus (e.g. individual comments); vocab_index: word -> column."""
-    N = B.shape[0]
-    cols = [vocab_index[w] for w in top_words if w in vocab_index]
-    df = np.asarray(B[:, cols].sum(axis=0)).ravel()
-    co = (B[:, cols].T @ B[:, cols]).toarray()
-    scores = []
-    for a in range(len(cols)):
-        for c in range(a + 1, len(cols)):
-            p1, p2, p12 = df[a] / N, df[c] / N, co[a, c] / N
-            if p12 == 0:
-                scores.append(-1.0)
-            else:
-                scores.append(np.log(p12 / (p1 * p2)) / -np.log(p12))
-    return float(np.mean(scores)) if scores else float("nan")
- 
- 
-# ----------------------------------------------------------------------------
-# Stage functions: each takes inputs and returns outputs, so people can own one
-# stage each and re-run one stage without redoing the others.
-# ----------------------------------------------------------------------------
- 
- 
-def save(obj, path):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "wb") as f:
-        pickle.dump(obj, f)
- 
- 
-def load(path):
-    with open(path, "rb") as f:
-        return pickle.load(f)
- 
- 
-def select_communities(levels, level=0, min_comm_size=30):
-    """Pick one Louvain level and drop small communities.
-    Returns user_comm: dict user -> community index 0..n_comm-1."""
-    membership, _ = levels[min(level, len(levels) - 1)]
-    sizes = pd.Series(membership).value_counts()
-    keep = sizes[sizes >= min_comm_size].index.tolist()
-    comm_id = {c: i for i, c in enumerate(keep)}
-    return {u: comm_id[c] for u, c in membership.items() if c in comm_id}
- 
- 
-def match_subreddits(df, user_comm, min_comments_per_sub=2, k=128, b=64, r=2, seed=0):
-    """Stage 2: MinHash + LSH + exact verification.
-    Returns dict(ranked, sub_names, comm_sizes, n_candidates, sig)."""
-    n_comm = max(user_comm.values()) + 1
-    graph_users = sorted(user_comm)
-    uid = {u: i for i, u in enumerate(graph_users)}
-    sub_names = sorted(df["subreddit"].unique())
-    sid = {s: i for i, s in enumerate(sub_names)}
- 
-    d = df[df["author"].isin(uid)]
-    cnt = d.groupby(["author", "subreddit"]).size().reset_index(name="n")
-    cnt = cnt[cnt.n >= min_comments_per_sub]
- 
-    # one list of (set id, user index) pairs: communities first, then subreddits
-    pairs_set = np.r_[[user_comm[u] for u in graph_users],
-                      n_comm + cnt["subreddit"].map(sid).values]
-    pairs_user = np.r_[np.arange(len(graph_users)), cnt["author"].map(uid).values]
-    sig = minhash(pairs_set, pairs_user, n_comm + len(sub_names), k=k, seed=seed)
- 
-    comm_users = [np.array(sorted(uid[u] for u, c in user_comm.items() if c == i))
-                  for i in range(n_comm)]
-    sub_users = [np.sort(cnt.loc[cnt.subreddit == s, "author"].map(uid).values)
-                 for s in sub_names]
-    cands = lsh_candidates(sig, n_comm, b, r)
-    ranked = rank_subreddits(cands, comm_users, sub_users, len(graph_users))
-    return {"ranked": ranked, "sub_names": sub_names, "n_candidates": len(cands),
-                "n_possible": n_comm * len(sub_names),
-                "comm_sizes": [len(c) for c in comm_users], "sig": sig}
- 
- 
-def label_words(df, user_comm, max_comments_per_user=50, min_count=20,
-                alpha0=1000.0, seed=0):
-    """Stage 3: one document per community, then log-odds z-scores.
-    Returns dict(Z, Y, words). Comments per user are capped by a random sample."""
-    n_comm = max(user_comm.values()) + 1
-    d = df[df["author"].isin(user_comm)].sample(frac=1, random_state=seed)
-    d = d.groupby("author", group_keys=False).head(max_comments_per_user)
-    d = d.assign(comm=d["author"].map(user_comm))
-    docs = d.groupby("comm")["body"].apply(" ".join).reindex(range(n_comm)).fillna("")
-    Y, words = community_term_matrix(docs.tolist(), min_count=min_count)
-    return {"Z": log_odds_z(Y, alpha0=alpha0), "Y": Y, "words": words}
-
-
-def community_names(labels, n_words=3):
-    """Name each community by its top log-odds words, e.g. 'python / error / pandas'."""
-    return {c: " / ".join(top_terms(labels["Z"], labels["words"], c, n_words))
-            for c in range(labels["Z"].shape[0])}
- 
- 
-def report(matches, labels, top=5):
-    """Print the combined description of every community."""
-    print(f"LSH: {matches['n_candidates']} candidate pairs out of {matches['n_possible']} possible")
-    for c, size in enumerate(matches["comm_sizes"]):
-        print(f"\nCommunity {c}  ({size} users)")
-        print("  subreddits (name, coverage, lift):",
-              [(matches["sub_names"][s], round(cov, 2), round(lift, 1))
-               for s, cov, lift, _ in matches["ranked"].get(c, [])[:top]])
-        print("  log-odds words:", top_terms(labels["Z"], labels["words"], c))
-        print("  tf-idf words  :", [w for w in tfidf_top_terms(labels["Y"], labels["words"], c)])
- 
- 
-def run(df, posts=None, level=0, min_comm_size=30, cache_dir=None, seed=0,
-        match_args=None, label_args=None):
-    """Thin wrapper that chains the stages. With cache_dir, each stage's output is
-    saved to disk and reloaded on the next call (delete the file to redo a stage)."""
-    def cached(name, fn):
-        path = os.path.join(cache_dir, name + ".pkl") if cache_dir else None
-        if path and os.path.exists(path):
-            return load(path)
-        out = fn()
-        if path:
-            save(out, path)
-        return out
- 
-    levels = cached("louvain_levels", lambda: louvain(build_reply_graph(df, posts), seed=seed))
-    for i, (m, q) in enumerate(levels):
-        print(f"Louvain level {i}: {len(set(m.values()))} communities, modularity {q:.3f}")
-    user_comm = select_communities(levels, level, min_comm_size)
-    matches = cached("matches", lambda: match_subreddits(df, user_comm, seed=seed, **(match_args or {})))
-    labels = cached("labels", lambda: label_words(df, user_comm, seed=seed, **(label_args or {})))
-    report(matches, labels)
-    return {"levels": levels, "user_comm": user_comm, "matches": matches, "labels": labels}
 
 
 # ----------------------------------------------------------------------------
-# Evaluation: null model and seed stability 
+# Evaluation: null model (Week 7 + Bonferroni's principle, Week 1) and vertex order
 # ----------------------------------------------------------------------------
 def to_unweighted(adj):
     """Same graph with every edge weight set to 1 (and self-loops removed)."""
     return {n: {m: 1.0 for m in nb if m != n} for n, nb in adj.items()}
- 
- 
+
+
 def rewire(adj, swaps_per_edge=10, seed=0):
     """Degree-preserving random rewiring (double edge swap): pick edges (a,b) and (c,d),
     replace them by (a,d) and (c,b) unless that makes a self-loop or a duplicate edge.
@@ -365,15 +295,15 @@ def rewire(adj, swaps_per_edge=10, seed=0):
         nbrs[a].remove(b); nbrs[b].remove(a); nbrs[c].remove(d); nbrs[d].remove(c)
         nbrs[a].add(d); nbrs[d].add(a); nbrs[c].add(b); nbrs[b].add(c)
         edges[i], edges[j] = (a, d), (c, b)
-    return {n: {m: 1.0 for m in s} for n, s in nbrs.items()}
- 
- 
+    return {n: {m: 1.0 for m in sorted(s, key=str)} for n, s in nbrs.items()}  # sorted: same result every run
+
+
 def _level_q(levels, level):
     """Modularity at a level; level=-1 means the coarsest (last) level."""
     idx = len(levels) - 1 if level == -1 else min(level, len(levels) - 1)
     return levels[idx][1]
- 
- 
+
+
 def null_model_test(adj, n_null=20, level=-1, seed=0):
     """Is the modularity of the real graph larger than in degree-preserving random graphs?
     Uses the unweighted graph for both, so the comparison is fair.
@@ -385,20 +315,117 @@ def null_model_test(adj, n_null=20, level=-1, seed=0):
     mean, std = float(np.mean(nulls)), float(np.std(nulls, ddof=1))
     return {"real": real, "null_mean": mean, "null_std": std,
                 "z": (real - mean) / std if std > 0 else float("inf"), "null_scores": nulls}
- 
- 
-def seed_stability(adj, n_seeds=10, level=-1):
-    """Run Louvain with different seeds and compare the partitions pairwise with NMI
-    (1 = identical partitions, 0 = unrelated). Returns dict(nmi_mean, nmi_std, q_mean, q_std)."""
-    from sklearn.metrics import normalized_mutual_info_score as nmi
-    nodes = sorted(adj, key=str)
-    parts, qs = [], []
-    for sd in range(n_seeds):
-        levels = louvain(adj, seed=sd)
+
+
+def order_stability(adj, n_orders=10, level=-1):
+    """Louvain depends on the (random) vertex order. Run it with different orders and report
+    how much the modularity and the number of communities change."""
+    qs, counts = [], []
+    for seed in range(n_orders):
+        levels = louvain(adj, seed=seed)
         idx = len(levels) - 1 if level == -1 else min(level, len(levels) - 1)
-        member = levels[idx][0]
-        parts.append([member[n] for n in nodes])
         qs.append(levels[idx][1])
-    scores = [nmi(parts[i], parts[j]) for i in range(n_seeds) for j in range(i + 1, n_seeds)]
-    return {"nmi_mean": float(np.mean(scores)), "nmi_std": float(np.std(scores)),
-            "q_mean": float(np.mean(qs)), "q_std": float(np.std(qs))}
+        counts.append(len(set(levels[idx][0].values())))
+    return {"q_mean": float(np.mean(qs)), "q_min": float(np.min(qs)), "q_max": float(np.max(qs)),
+            "n_comm_min": int(min(counts)), "n_comm_max": int(max(counts))}
+
+
+# ----------------------------------------------------------------------------
+# Evaluation: does the similarity graph help to recommend subreddits? (hold-out test)
+# ----------------------------------------------------------------------------
+def hold_out(sets, min_memberships=3, seed=0):
+    """Hide one random membership of every user with at least min_memberships subreddits.
+    Returns the training (set_idx, user_idx) pairs and the hidden (user, subreddit) pairs."""
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(sets["set_idx"]))
+    s, u = sets["set_idx"][order], sets["user_idx"][order]
+    counts = np.bincount(u, minlength=sets["n_users"])
+    first = np.unique(u, return_index=True)[1]                  # one random membership per user
+    hidden = first[counts[u[first]] >= min_memberships]
+    keep = np.ones(len(s), bool)
+    keep[hidden] = False
+    return {"set_idx": s[keep], "user_idx": u[keep], "test_user": u[hidden], "test_set": s[hidden]}
+
+
+def similarity_matrix(similar, n_sets):
+    """Dense symmetric matrix W[i, j] = Jaccard of the verified pairs, 0 otherwise."""
+    W = np.zeros((n_sets, n_sets))
+    for (i, j), jac in similar.items():
+        W[i, j] = W[j, i] = jac
+    return W
+
+
+def recommendation_ranks(split, W, n_sets, n_users):
+    """Score every subreddit for a user by its summed similarity to the user's other subreddits
+    (ties broken by popularity) and return the rank of the hidden subreddit (1 = top)."""
+    U = sp.csr_matrix((np.ones(len(split["set_idx"])), (split["user_idx"], split["set_idx"])),
+                      shape=(n_users, n_sets))
+    popularity = np.asarray(U.sum(axis=0)).ravel()
+    users = split["test_user"]
+    scores = np.asarray(U[users] @ W) + 1e-9 * popularity / popularity.max()
+    scores[U[users].toarray() > 0] = -np.inf                      # do not recommend known subreddits
+    hidden_score = scores[np.arange(len(users)), split["test_set"]]
+    return 1 + (scores > hidden_score[:, None]).sum(axis=1)
+
+
+def hit_rate(ranks, ks):
+    return np.array([(ranks <= k).mean() for k in ks])
+
+
+# ----------------------------------------------------------------------------
+# Evaluation: runtime of LSH vs. comparing all pairs as the number of subreddits grows
+# ----------------------------------------------------------------------------
+def scaling_experiment(sets, sizes, n_hash, b, r, threshold, seed=0):
+    rng = np.random.default_rng(seed)
+    n_sets = len(sets["names"])
+    rows = []
+    for m in sizes:
+        chosen = np.sort(rng.choice(n_sets, size=min(m, n_sets), replace=False))
+        new_id = -np.ones(n_sets, int)
+        new_id[chosen] = np.arange(len(chosen))
+        mask = new_id[sets["set_idx"]] >= 0
+        s_idx, u_idx = new_id[sets["set_idx"][mask]], sets["user_idx"][mask]
+        user_sets = [set(u_idx[s_idx == k]) for k in range(len(chosen))]
+
+        start = time.perf_counter()
+        exact = all_pairs_jaccard(user_sets)
+        time_exact = time.perf_counter() - start
+        start = time.perf_counter()
+        sig = minhash(s_idx, u_idx, len(chosen), k=n_hash)
+        found = verify(lsh_pairs(sig, b, r), user_sets, threshold)
+        time_lsh = time.perf_counter() - start
+
+        similar = {p for p, jac in exact.items() if jac >= threshold}
+        rows.append({"subreddits": len(chosen), "pairs": len(exact), "time exact [s]": time_exact,
+                     "time LSH [s]": time_lsh, "recall": len(similar & set(found)) / max(len(similar), 1)})
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------
+# Who goes where: lift (Week 5) of each seed subreddit's users per community
+# ----------------------------------------------------------------------------
+def seed_lift(activity, sub_comm, seeds, communities, min_count=2, n_boot=500, seed=0):
+    """Users who come from exactly one seed subreddit form a group per seed. For every group and
+    community: share of the group's users who are members of the community, divided by the share
+    among all users (lift; 1 = as often as everybody else). A bootstrap over the group's users
+    gives a 95% interval. Returns dict(lift, low, high, sizes) with communities as rows."""
+    rng = np.random.default_rng(seed)
+    seed_sets = activity[activity["subreddit"].isin(seeds)].groupby("user")["subreddit"].apply(frozenset)
+    members = activity[(activity["count"] >= min_count) & activity["subreddit"].isin(sub_comm)]
+    users = sorted(members["user"].unique())                      # users with at least one membership
+    row = {u: i for i, u in enumerate(users)}
+    A = np.zeros((len(users), len(communities)), bool)              # user x community membership
+    col = {c: j for j, c in enumerate(communities)}
+    for u, s in zip(members["user"], members["subreddit"]):
+        if sub_comm[s] in col:
+            A[row[u], col[sub_comm[s]]] = True
+    overall = A.mean(axis=0)
+    lift, low, high, sizes = {}, {}, {}, {}
+    for s in seeds:
+        group = np.array([row[u] for u, ss in seed_sets.items() if ss == frozenset([s]) and u in row])
+        sizes[s] = len(group)
+        lift[s] = A[group].mean(axis=0) / overall
+        boot = np.array([A[rng.choice(group, len(group))].mean(axis=0) / overall for _ in range(n_boot)])
+        low[s], high[s] = np.percentile(boot, [2.5, 97.5], axis=0)
+    frame = lambda d: pd.DataFrame(d, index=communities)
+    return {"lift": frame(lift), "low": frame(low), "high": frame(high), "sizes": sizes}
